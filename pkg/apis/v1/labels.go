@@ -57,6 +57,10 @@ const (
 	// scheduled to this NodeClaim. The initialization controller can gate on these drivers having published their
 	// ResourceSlices before marking the node initialized.
 	DRADriversAnnotationKey = apis.Group + "/requested-dra-drivers"
+	// FlexibleCapacityAnnotationKey records, as a JSON map, the amount that Karpenter chose for each extended resource
+	// that a NodeOverlay declares in maxCapacity. The cloud provider must give the node exactly these amounts. When the
+	// annotation is absent, the node gets none of these resources.
+	FlexibleCapacityAnnotationKey = apis.Group + "/flexible-capacity"
 )
 
 // Karpenter specific finalizers
