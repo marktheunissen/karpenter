@@ -126,6 +126,16 @@ var _ = Describe("Flexible Capacity", func() {
 		})
 	})
 	Context("FitsAllocatable", func() {
+		It("should not let a request above the ceiling fit, even when an offering's allocatable is higher", func() {
+			it := newFlexibleTestInstanceType()
+			it.ApplyMaxCapacityOverlay(corev1.ResourceList{hugePages2Mi: resource.MustParse("8Gi")})
+			// An offering's capacity override can give an allocatable above the ceiling
+			allocatable := it.Allocatable()
+			allocatable[hugePages2Mi] = resource.MustParse("12Gi")
+
+			Expect(it.FitsAllocatable(corev1.ResourceList{hugePages2Mi: resource.MustParse("10Gi")}, allocatable)).To(BeFalse())
+			Expect(it.FitsAllocatable(corev1.ResourceList{hugePages2Mi: resource.MustParse("8Gi")}, allocatable)).To(BeTrue())
+		})
 		It("should behave like resources.Fits when nothing is flexible", func() {
 			it := newFlexibleTestInstanceType()
 			it.ApplyCapacityOverlay(corev1.ResourceList{hugePages2Mi: resource.MustParse("4Gi")})
