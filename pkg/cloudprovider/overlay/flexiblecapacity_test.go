@@ -41,9 +41,14 @@ import (
 const hugePages2Mi corev1.ResourceName = "hugepages-2Mi"
 
 // rawStatusCloudProvider reports the capacity and allocatable of the instance type with NodeOverlays applied, as they
-// are, in the status that Create returns. This is the case where a provider reports the ceiling.
+// are, in the status that Create returns. This is the case where a provider reports the ceiling. The AWS provider does
+// the same.
 type rawStatusCloudProvider struct {
 	*fake.CloudProvider
+	// beforeApply and afterApply run during Create, before and after it applies the NodeOverlays. A test uses them to
+	// change the NodeOverlays during the launch.
+	beforeApply func()
+	afterApply  func()
 }
 
 func (r *rawStatusCloudProvider) Create(ctx context.Context, nodeClaim *v1.NodeClaim) (*v1.NodeClaim, error) {
@@ -51,17 +56,23 @@ func (r *rawStatusCloudProvider) Create(ctx context.Context, nodeClaim *v1.NodeC
 	if err != nil {
 		return nil, err
 	}
+	if r.beforeApply != nil {
+		r.beforeApply()
+	}
 	it, err := store.Apply(nodeClaim.Labels[v1.NodePoolLabelKey], r.InstanceTypes[0])
 	if err != nil {
 		return nil, err
 	}
 	created.Status.Capacity = it.Capacity
 	created.Status.Allocatable = it.Allocatable()
+	if r.afterApply != nil {
+		r.afterApply()
+	}
 	return created, nil
 }
 
 // noOverlayStatusCloudProvider reports the capacity and allocatable of the instance type without NodeOverlays, in the
-// status that Create returns. The AWS provider does the same.
+// status that Create returns.
 type noOverlayStatusCloudProvider struct {
 	*fake.CloudProvider
 }
@@ -91,13 +102,15 @@ func hugePagesOverlay(capacity, maxCapacity corev1.ResourceList) *v1alpha1.NodeO
 var _ = Describe("Flexible Capacity", func() {
 	var nodePool *v1.NodePool
 	var nodeClaim *v1.NodeClaim
+	var raw *rawStatusCloudProvider
 	var decorated cloudprovider.CloudProvider
 	var gatedCtx context.Context
 	BeforeEach(func() {
 		fakeCloudProvider.Reset()
 		store.Reset()
 		fakeCloudProvider.InstanceTypes = []*cloudprovider.InstanceType{fake.NewInstanceType("default-instance-type")}
-		decorated = overlay.Decorate(&rawStatusCloudProvider{CloudProvider: fakeCloudProvider}, env.Client, store)
+		raw = &rawStatusCloudProvider{CloudProvider: fakeCloudProvider}
+		decorated = overlay.Decorate(raw, env.Client, store)
 		gatedCtx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeOverlay: lo.ToPtr(true)}}))
 
 		nodePool = test.NodePool()
@@ -201,6 +214,45 @@ var _ = Describe("Flexible Capacity", func() {
 			created, err := decorated.Create(gatedCtx, nodeClaim)
 			Expect(err).ToNot(HaveOccurred())
 			expectChosenAmount(created)
+		})
+	})
+	Context("when the NodeOverlays change during the launch", func() {
+		// The cloud provider applies the NodeOverlays during the launch, and reports the ceiling. No pod asked for
+		// hugepages, so the node gets none, and the status must not report any.
+		var maxCapacityOverlay *v1alpha1.NodeOverlay
+		BeforeEach(func() {
+			delete(nodeClaim.Annotations, v1.FlexibleCapacityAnnotationKey)
+			maxCapacityOverlay = hugePagesOverlay(nil, corev1.ResourceList{hugePages2Mi: resource.MustParse("8Gi")})
+		})
+		expectNoHugePages := func(created *v1.NodeClaim) {
+			GinkgoHelper()
+			Expect(created.Status.Capacity).ToNot(HaveKey(hugePages2Mi))
+			Expect(created.Status.Allocatable).ToNot(HaveKey(hugePages2Mi))
+			Expect(created.Status.Allocatable.Memory().Value()).To(Equal(overlaidMemory()))
+		}
+		It("should remove the ceiling when maxCapacity is removed after the cloud provider applied it", func() {
+			ExpectApplied(ctx, env.Client, nodePool, maxCapacityOverlay)
+			ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
+			raw.afterApply = func() {
+				ExpectDeleted(ctx, env.Client, maxCapacityOverlay)
+				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
+			}
+
+			created, err := decorated.Create(gatedCtx, nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			expectNoHugePages(created)
+		})
+		It("should remove the ceiling when maxCapacity is added before the cloud provider applies it", func() {
+			ExpectApplied(ctx, env.Client, nodePool)
+			ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
+			raw.beforeApply = func() {
+				ExpectApplied(ctx, env.Client, maxCapacityOverlay)
+				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
+			}
+
+			created, err := decorated.Create(gatedCtx, nodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			expectNoHugePages(created)
 		})
 	})
 	Context("when loading what the correction needs fails", func() {
