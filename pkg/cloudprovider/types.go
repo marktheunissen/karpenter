@@ -420,12 +420,19 @@ func (i *InstanceType) FlexibleCapacity() corev1.ResourceList {
 
 // FitsAllocatable reports whether the requests fit in the allocatable resources of this instance type. Flexible
 // hugepages are not taken out of allocatable memory ahead of time, so their requests are charged against memory here.
+// A request for a flexible resource must also be within its ceiling. An offering's capacity override can raise the
+// allocatable amount above the ceiling, but the NodeOverlay's ceiling still applies.
 func (i *InstanceType) FitsAllocatable(requests, allocatable corev1.ResourceList) bool {
 	if !resources.Fits(requests, allocatable) {
 		return false
 	}
 	if len(i.flexibleCapacity) == 0 {
 		return true
+	}
+	for name, ceiling := range i.flexibleCapacity {
+		if quantity, ok := requests[name]; ok && quantity.Cmp(ceiling) > 0 {
+			return false
+		}
 	}
 	memory := requests.Memory().DeepCopy()
 	for name := range i.flexibleCapacity {
