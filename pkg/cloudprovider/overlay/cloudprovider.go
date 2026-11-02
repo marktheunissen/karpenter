@@ -73,12 +73,12 @@ func (d *decorator) Create(ctx context.Context, nodeClaim *v1.NodeClaim) (*v1.No
 		return nil, err
 	}
 	created, err := d.CloudProvider.Create(ctx, nodeClaim)
-	if err != nil || inputs == nil {
+	if err != nil {
 		return created, err
 	}
 	// The instance exists now. If Create returned an error, Karpenter would launch again and leak this instance, so a
-	// failed correction is only logged. The correction uses only the loaded inputs, so it is not expected to fail.
-	if err := d.correctFlexibleCapacity(inputs, created); err != nil {
+	// failed correction is only logged.
+	if err := d.correctFlexibleCapacity(ctx, nodeClaim, inputs, created); err != nil {
 		log.FromContext(ctx).Error(err, "failed setting flexible capacity in nodeclaim status", "NodeClaim", klog.KObj(nodeClaim))
 	}
 	return created, nil
@@ -89,6 +89,9 @@ type flexibleCapacityInputs struct {
 	nodePoolName  string
 	flexible      corev1.ResourceList
 	instanceTypes []*cloudprovider.InstanceType
+	// flexibleNames lists, for each instance type, the resources that a NodeOverlay set maxCapacity for before the
+	// launch.
+	flexibleNames map[string][]corev1.ResourceName
 }
 
 // flexibleCapacityInputs returns nil when the NodeClaim needs no correction: it has no amounts in the annotation, and
@@ -107,6 +110,10 @@ func (d *decorator) flexibleCapacityInputs(ctx context.Context, nodeClaim *v1.No
 	if len(flexible) == 0 && !d.store.NodePoolHasFlexibleCapacity(nodePoolName) {
 		return nil, nil
 	}
+	return d.loadFlexibleCapacityInputs(ctx, nodePoolName, flexible)
+}
+
+func (d *decorator) loadFlexibleCapacityInputs(ctx context.Context, nodePoolName string, flexible corev1.ResourceList) (*flexibleCapacityInputs, error) {
 	nodePool := &v1.NodePool{}
 	if err := d.kubeClient.Get(ctx, client.ObjectKey{Name: nodePoolName}, nodePool); err != nil {
 		return nil, fmt.Errorf("getting nodepool, %w", err)
@@ -115,17 +122,53 @@ func (d *decorator) flexibleCapacityInputs(ctx context.Context, nodeClaim *v1.No
 	if err != nil {
 		return nil, fmt.Errorf("getting cloud provider instance types, %w", err)
 	}
-	return &flexibleCapacityInputs{nodePoolName: nodePoolName, flexible: flexible, instanceTypes: its}, nil
+	flexibleNames := map[string][]corev1.ResourceName{}
+	overlaid, err := d.store.ApplyAll(nodePoolName, its)
+	switch {
+	case cloudprovider.IsUnevaluatedNodePoolError(err):
+		// The NodeOverlay controller has not evaluated the NodePool yet, so no NodeOverlay applies.
+	case err != nil:
+		return nil, fmt.Errorf("applying nodeoverlays, %w", err)
+	default:
+		for _, it := range overlaid {
+			if names := lo.Keys(it.FlexibleCapacity()); len(names) != 0 {
+				flexibleNames[it.Name] = names
+			}
+		}
+	}
+	return &flexibleCapacityInputs{nodePoolName: nodePoolName, flexible: flexible, instanceTypes: its, flexibleNames: flexibleNames}, nil
 }
 
 // correctFlexibleCapacity sets the chosen amount of each flexible resource in the status of the launched NodeClaim.
-func (d *decorator) correctFlexibleCapacity(inputs *flexibleCapacityInputs, created *v1.NodeClaim) error {
+//
+// The cloud provider applies the NodeOverlays itself during the launch, and may report the ceiling in the status. A
+// NodeOverlay can change during the launch, so the correction does not know which NodeOverlays the cloud provider
+// used. It removes each resource that is flexible before or after the launch and has no chosen amount. It cannot
+// detect a maxCapacity that is added and removed again during the launch. The status is then wrong only until the
+// node initializes, because Karpenter then uses the resources that the node reports.
+func (d *decorator) correctFlexibleCapacity(ctx context.Context, nodeClaim *v1.NodeClaim, inputs *flexibleCapacityInputs, created *v1.NodeClaim) error {
 	instanceTypeName, ok := created.Labels[corev1.LabelInstanceTypeStable]
 	if !ok {
 		return nil
 	}
-	nodePoolName, flexible := inputs.nodePoolName, inputs.flexible
-	if len(flexible) == 0 && !d.store.HasFlexibleCapacity(nodePoolName, instanceTypeName) {
+	nodePoolName, ok := nodeClaim.Labels[v1.NodePoolLabelKey]
+	if !ok {
+		return nil
+	}
+	if inputs == nil {
+		// No correction was needed before the launch. A NodeOverlay may have set maxCapacity during the launch, so check
+		// again.
+		if !d.store.HasFlexibleCapacity(nodePoolName, instanceTypeName) {
+			return nil
+		}
+		var err error
+		if inputs, err = d.loadFlexibleCapacityInputs(ctx, nodePoolName, nil); err != nil {
+			return err
+		}
+	}
+	flexible := inputs.flexible
+	flexibleBefore := inputs.flexibleNames[instanceTypeName]
+	if len(flexible) == 0 && len(flexibleBefore) == 0 && !d.store.HasFlexibleCapacity(nodePoolName, instanceTypeName) {
 		return nil
 	}
 	it, ok := lo.Find(inputs.instanceTypes, func(it *cloudprovider.InstanceType) bool { return it.Name == instanceTypeName })
@@ -142,6 +185,10 @@ func (d *decorator) correctFlexibleCapacity(inputs *flexibleCapacityInputs, crea
 	default:
 		it = overlaid
 	}
-	created.Status.Capacity, created.Status.Allocatable = cloudprovider.FlexibleCapacityStatus(it, created.Status.Capacity, created.Status.Allocatable, flexible)
+	capacity, allocatable := cloudprovider.FlexibleCapacityStatus(it, created.Status.Capacity, created.Status.Allocatable, flexible)
+	// FlexibleCapacityStatus removes the resources that are flexible now. Also remove those that were flexible before
+	// the launch and have no chosen amount.
+	notChosen := lo.Without(flexibleBefore, lo.Keys(flexible)...)
+	created.Status.Capacity, created.Status.Allocatable = lo.OmitByKeys(capacity, notChosen), lo.OmitByKeys(allocatable, notChosen)
 	return nil
 }
