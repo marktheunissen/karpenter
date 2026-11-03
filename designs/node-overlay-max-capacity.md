@@ -1,0 +1,146 @@
+# NodeOverlay Max Capacity
+
+## Background
+
+A [NodeOverlay](./node-overlay.md) can add extended resources to the instance types it matches, with `spec.capacity`. The amount is fixed: every node launched from a matching instance type is assumed to have exactly that amount.
+
+That model does not fit resources whose amount is decided when the node boots. Hugepages are the main example. The kernel reserves hugepages at boot, and kubelet reports the count when it starts. Today, to run a database that needs 8602Mi of 2Mi hugepages, a user must:
+
+* create a NodePool and a NodeOverlay (and often a NodeClass) for each page count, and
+* send each pod to the NodePool for its page count.
+
+Each node then reserves the full page count for its pool, even when its pods need less. The number of NodePools grows with the number of page counts in use.
+
+## Proposal
+
+Add an optional field, `spec.maxCapacity`, to NodeOverlay. It sets a **ceiling** for an extended resource, not an exact amount. When Karpenter launches a node, it gives the node exactly what the pods packed onto it request, up to the ceiling. It tells the cloud provider the chosen amount with a NodeClaim annotation.
+
+```yaml
+apiVersion: karpenter.sh/v1alpha1
+kind: NodeOverlay
+metadata:
+  name: hugepages
+spec:
+  requirements:
+    - key: karpenter.sh/nodepool
+      operator: In
+      values: ["postgres"]
+  maxCapacity:
+    hugepages-2Mi: 64Gi
+```
+
+With this overlay, a pod that requests `hugepages-2Mi: 8602Mi` gets a node with 8602Mi of 2Mi hugepages. A pod that requests none gets a node with none.
+
+### API
+
+* `maxCapacity` is a `ResourceList`. Like `capacity`, it must not contain `cpu`, `memory`, `ephemeral-storage` or `pods`.
+* A resource must not be set in both `capacity` and `maxCapacity` of the same NodeOverlay. A CEL rule enforces this.
+* Runtime validation also rejects:
+  * values of zero or less
+  * `hugepages-<size>` values that are not a whole number of pages
+* The field is covered by the existing alpha `NodeOverlay` feature gate. When no NodeOverlay sets `maxCapacity`, Karpenter behaves exactly as before.
+
+### Merging overlays
+
+The merge rules for `capacity` are applied to both fields, per resource name:
+
+* For each resource, the highest weight overlay wins, whether it sets the resource in `capacity` or in `maxCapacity`. A higher weight `capacity` therefore makes a resource fixed again, and a higher weight `maxCapacity` makes it flexible.
+* Two overlays with the same weight that set the same resource, in either field, are in conflict. The overlay that is evaluated second is marked with `ValidationSucceeded=False` and reason `Conflict`, as today.
+
+### Scheduling
+
+An instance type keeps the ceiling in its capacity, and records which resources are flexible.
+
+* **Fit.** A request above the ceiling does not fit.
+* **Hugepages and memory.** Kubernetes takes hugepages out of a node's allocatable memory. For a fixed amount, Karpenter already subtracts it from allocatable memory ahead of time. For a flexible amount, it cannot, because the amount is not known yet. Instead, a set of pods fits only if their memory requests plus their flexible hugepages requests fit in allocatable memory.
+* **Chosen amount.** When scheduling finishes, the amount of each flexible resource is the pods' requests plus the largest daemonset overhead for that resource across the remaining instance types. Karpenter uses the largest overhead so the daemonsets fit whichever instance type launches. Instance types that cannot hold these amounts are removed. With more than one flexible resource, the largest overheads can come from different instance types, so that no instance type can hold them all. Karpenter then keeps only the instance types that share one daemonset overhead, because each of them fits the pods plus its own daemonsets. The NodeClaim's `spec.resources.requests` holds the same amount.
+* **One amount per NodeClaim.** A NodeClaim can launch as any of several instance types, but it can carry only one amount. If a requested resource is flexible on some remaining instance types and fixed on others, Karpenter keeps only the flexible ones. It does this while it adds pods, so price filtering and truncation later on cannot break it. Resources that no pod requests are not narrowed.
+
+### The annotation
+
+Karpenter writes the chosen amounts on the NodeClaim:
+
+```yaml
+metadata:
+  annotations:
+    karpenter.sh/flexible-capacity: '{"hugepages-2Mi":"8602Mi"}'
+```
+
+* The value is a JSON map from resource name to quantity.
+* It lists only flexible resources with an amount greater than zero.
+* When the annotation is absent, the node gets none of the flexible resources. Nodes whose pods request no flexible resources look exactly as they did before this change.
+* The annotation is internal: only Karpenter sets it.
+* Karpenter copies NodeClaim annotations to the Node when the node registers, so the annotation is also on the Node.
+
+### Cloud provider contract
+
+A cloud provider that supports flexible capacity must, in `Create`:
+
+1. read the annotation, with `cloudprovider.FlexibleCapacityFromNodeClaim`, and
+2. give the node exactly those amounts, for example by setting `vm.nr_hugepages` in user data.
+
+Karpenter itself sets the NodeClaim status. The NodeOverlay decorator wraps `Create`. When the NodeClaim has the annotation, or a NodeOverlay sets `maxCapacity` for the launched instance type, the decorator replaces each flexible resource in the returned `status.capacity` and `status.allocatable` with the chosen amount, or removes it when no amount was chosen. It also takes the chosen hugepages out of `status.allocatable.memory`. The annotation decides, not only the current NodeOverlays. The provider gives the node the amounts in the annotation, even if a NodeOverlay was deleted or changed, or Karpenter restarted, after Karpenter chose them. A provider can therefore report the instance type as it is, with the ceiling. The correction gives the same result if the provider already applied the amounts, for example with `cloudprovider.ApplyFlexibleCapacity`. The decorator loads the NodePool and the instance types before it calls the provider's `Create`. If that fails, it returns the error before any instance exists, and Karpenter retries the launch. It also records which resources the NodeOverlays make flexible at that time. A provider may apply the NodeOverlays again during the launch, for example to report the ceiling, and a NodeOverlay can change in between. So the correction removes each resource that is flexible before or after the launch and has no chosen amount. If no correction was needed before the launch, but a NodeOverlay set `maxCapacity` during it, the decorator loads the NodePool and the instance types after the launch. If anything fails after the launch, the error is only logged, because returning it would make Karpenter launch a second instance.
+
+Kubernetes requires a hugepages request to be a whole number of pages, so the chosen amount is always a whole number of pages.
+
+#### AWS
+
+The AWS provider supports hugepages on the AL2 and AL2023 AMI families. AL2 user data also works on Ubuntu EKS AMIs.
+
+* It adds a shell script to the user data. The script writes the page count for each page size to `/sys/kernel/mm/hugepages/hugepages-<size>kB/nr_hugepages`.
+* The script runs after the user's own user data, so its page counts replace any that the user sets. It runs before kubelet starts:
+  * on AL2, before `/etc/eks/bootstrap.sh`;
+  * on AL2023, before nodeadm, which starts kubelet only after cloud-init has run the user data scripts.
+* If the kernel allocates fewer pages than asked, the script frees cached memory, compacts memory and tries once more. It logs the result.
+* User data scripts run only on the first boot. So the script also writes the 2Mi page count to `/etc/sysctl.d/zzzz-hugepages.conf`. On every later boot, systemd-sysctl sets `vm.nr_hugepages` from that file before kubelet starts. Other page sizes have no sysctl, so their counts are lost when the node reboots.
+* The script runs after the user's own user data. If that user data also writes `/etc/sysctl.d/zzzz-hugepages.conf`, Karpenter's script replaces the file, so the node keeps Karpenter's count after a reboot too.
+* The page counts are part of the user data, so each distinct page count gets its own launch template.
+* On the other AMI families (Bottlerocket, Windows and Custom), a launch that needs hugepages fails with an error. Without this check, the node would start without its hugepages and never initialize.
+* A flexible resource that is not hugepages also fails the launch, because the provider cannot allocate it.
+* The script sets only the page sizes in the annotation. When no pod requests hugepages, there is no annotation and no script. So the user data and the AMI must not allocate hugepages of a size that a NodeOverlay makes flexible. Otherwise, a node that Karpenter gives no pages of that size still has them, and Karpenter expects more allocatable memory than the node has. See "Known limits".
+
+Because the annotation is on the Node, a DaemonSet can also read it and allocate the pages when the node joins. This works on providers whose NodeClass cannot carry a page count. But kubelet reads the hugepages count only when it starts, and it sets the hugetlb limit of the `kubepods` cgroup at the same time. A DaemonSet must therefore restart kubelet after it allocates the pages. Allocation in user data, before kubelet starts, does not need a restart.
+
+### After launch
+
+* **In-flight and existing nodes.** Karpenter models a node from its NodeClaim status, and then from the Node. Both hold the chosen amount, so a launched node never takes pods beyond it.
+* **Initialization.** A NodeClaim is not initialized until every resource it requests has non-zero allocatable on the Node. A node is therefore not treated as ready before its hugepages appear.
+* **Consolidation.** Consolidation runs the same scheduling simulation, so a replacement node is sized to the pods that remain.
+* **Drift.** Editing an overlay does not drift nodes. This is the same as `capacity` today.
+* **NodePool limits.** While a NodeClaim is being built, its instance types are charged their full capacity against NodePool limits, including the ceiling. This only matters if a NodePool sets a limit on a flexible resource. After launch, the NodeClaim status holds the chosen amount.
+
+## Known limits
+
+* **Pages stay allocated.** The page count is fixed when the node boots. When a hugepages pod leaves:
+  * a new pod that needs no more than the free pages can use them;
+  * pods without hugepages can use only the memory left after the pages, because Linux keeps hugepages in a separate pool, and kubelet sets a hugetlb limit of zero for pods that do not request them;
+  * consolidation frees the pages when a cheaper replacement fits the remaining pods. If the same instance type is still needed, the pages stay unused.
+
+  For workloads that run one pod per node, a NodePool taint and `WhenEmpty` or `WhenEmptyOrUnderutilized` consolidation remove the node after its pod leaves. Workloads that run several pods per node may keep unused pages. Possible follow-ups are a metric for unused flexible capacity, or a consolidation rule for it.
+* **Providers must opt in.** A provider that ignores the annotation launches a node without the resource. The NodeClaim requests the resource, so it never becomes initialized, and the pod stays pending. If `expireAfter` is `Never`, the node stays in this state until someone deletes it (kubernetes-sigs/karpenter#3242). A wrong fixed overlay has the same effect today.
+* **Nodes cannot grow.** A later pod that needs more of a flexible resource than a node has gets a new node.
+* **The kernel may allocate fewer pages than asked.** On AWS, if the kernel allocates fewer pages, the script frees cached memory, compacts memory and tries once more. If it still has fewer, it logs the result and kubelet starts anyway. The node then reports the real count, so no pod gets pages that do not exist. Once the node is initialized, Karpenter models it from those real values, launches another node for pods that do not fit, and consolidation later removes the short node. A shortfall is unlikely for 2Mi pages, because the script runs at first boot, before kubelet and any workloads, and the chosen amount leaves the reserved and eviction memory free. 1Gi pages need contiguous memory, so they are more at risk. Other ways to handle a shortfall were rejected:
+  * Making the script fail does not stop kubelet. cloud-init still runs the other user data scripts, and the bootstrap starts kubelet.
+  * Shutting the instance down would replace it, but makes the failure hard to see and debug, and could replace instances again and again if the shortfall repeats.
+  * Requiring the full amount before the node is initialized would leave the node uninitialized with no timeout (kubernetes-sigs/karpenter#3242). Karpenter would also keep trusting the NodeClaim's amount, so it would launch no other node, and the pod would stay pending.
+* **Pages from other sources are not removed.** On AWS, the provider sets only the page sizes in the annotation. If the user data or the AMI also allocates hugepages, a node that Karpenter gives none of that size keeps them. Karpenter then expects more allocatable memory than the node has. After the node registers, Karpenter uses the node's real memory for that node, but it still expects the full memory on new nodes of the same instance type. It can therefore launch node after node that is too small for the pending pods. Stock Karpenter has the same problem with any NodeClass that allocates hugepages without a NodeOverlay. Users must not allocate hugepages outside Karpenter for a size that a NodeOverlay makes flexible. A possible fix is for Karpenter to write a zero amount in the annotation for each resource that is flexible on every remaining instance type, and for the provider to set those sizes to zero. This changes the annotation contract, and gives every node in such a NodePool the script, so it is left for later.
+* **A NodeOverlay that changes twice during a launch.** The decorator and the provider each read the current NodeOverlays at a different time during `Create`. If someone adds `maxCapacity` and removes it again in that time, the provider may report the ceiling, and the decorator does not see that the resource was flexible. The NodeClaim status then shows hugepages that the node does not have. This lasts only until the node initializes. Initialization checks the resources that the pods request, not the status, so it is not delayed. After that, Karpenter uses the resources that the node reports. kube-scheduler always uses the node's real resources, so no pod is bound to a node without its hugepages. At worst, Karpenter plans pods onto the new node and then launches another node for them. A full fix would make the provider and the decorator use the same view of the NodeOverlays, for example a snapshot of the store passed in the context to `ApplyAll`. That changes the `ApplyAll` signature for every provider, so it is left for later.
+
+## Alternatives considered
+
+* **Size the resource in the cloud provider.** The provider sees only the NodeClaim, after scheduling. Karpenter must know the amount during scheduling to decide which pods fit and which instance type to launch.
+* **Per-offering capacity overrides.** `Offering.CapacityOverride` sets a different fixed amount for each offering. It does not let the amount follow the pods.
+* **A separate feature gate.** NodeOverlay is already alpha and off by default, and `maxCapacity` does nothing unless it is set, so the existing gate is enough.
+
+## Testing
+
+* Unit tests cover validation, overlay merging and conflicts, instance type allocatable and fit, scheduling (the chosen amount, daemonset overhead, the ceiling, memory coupling, narrowing, in-flight nodes), consolidation sizing, and the KWOK provider.
+* E2E tests in `test/suites/regression/nodeoverlay_test.go` run on kind with the KWOK provider. The KWOK provider reads the annotation and builds the node's capacity and allocatable from it. The tests show that:
+  * fixed `capacity` overlays still work;
+  * a node gets exactly the hugepages its pod requests, and its allocatable memory is reduced by that amount;
+  * a request above the ceiling does not launch a node;
+  * memory and hugepages together select a larger instance type;
+  * nodes are sized to their own pods;
+  * a pod without hugepages gets none;
+  * a consolidation replacement is sized to the pods that remain;
+  * a same-weight overlay that sets the resource in the other field is marked as a conflict.
